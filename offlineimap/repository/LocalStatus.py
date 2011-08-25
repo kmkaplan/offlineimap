@@ -21,6 +21,8 @@ from offlineimap import folder
 import offlineimap.folder.LocalStatus
 import os
 import re
+import contextlib
+import shelve
 
 class LocalStatusRepository(BaseRepository):
     def __init__(self, reposname, account):
@@ -41,12 +43,8 @@ class LocalStatusRepository(BaseRepository):
     def makefolder(self, foldername):
         # "touch" the file, truncating it.
         filename = self.getfolderfilename(foldername)
-        file = open(filename + ".tmp", "wt")
-        file.write(offlineimap.folder.LocalStatus.magicline + '\n')
-        file.flush()
-        os.fsync(file.fileno())
-        file.close()
-        os.rename(filename + ".tmp", filename)
+        with contextlib.closing(shelf.open(filename, 'n')) as db:
+            None
         
         # Invalidate the cache.
         self.folders = None

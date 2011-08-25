@@ -18,9 +18,50 @@
 
 from Base import BaseFolder
 import os
+from contextlib import closing
+import anydbm
+import shelve
 import threading
+import whichdb
+import sys
 
 magicline = "OFFLINEIMAP LocalStatus CACHE DATA - DO NOT MODIFY - FORMAT 1"
+
+class _MessageList():
+    @staticmethod
+    def _from_key(key):
+        return str(key)
+
+    @staticmethod
+    def _to_key(index):
+        return long(index)
+
+    def __init__(self, filename, flag):
+        self.shelf = shelve.open(filename, flag)
+
+    def __del__(self):
+        self.close()
+
+    def __len__(self):
+        return len(self.shelf)
+
+    def __getitem__(self, key):
+        return self.shelf[_MessageList._from_key(key)]
+
+    def __setitem__(self, key, value):
+        self.shelf[_MessageList._from_key(key)] = value
+
+    def __delitem__(self, key):
+        del self.shelf[_MessageList._from_key(key)]
+
+    def __contains__(self, key):
+        return _MessageList._from_key(key) in self.shelf
+
+    def close(self):
+        self.shelf.close()
+
+    def keys(self):
+        return [_MessageList._to_key(k) for k in self.shelf.keys()]
 
 class LocalStatusFolder(BaseFolder):
     def __init__(self, root, name, repository, accountname, config):
@@ -32,11 +73,49 @@ class LocalStatusFolder(BaseFolder):
         self.filename = os.path.join(root, name)
         self.filename = repository.getfolderfilename(name)
         self.messagelist = None
+        self.filename_2 = self.filename + '.shelve'
         self.repository = repository
         self.savelock = threading.Lock()
-        self.doautosave = 1
         self.accountname = accountname
         BaseFolder.__init__(self)
+        self.migrate_format1_to_format2()
+
+    def is_format1(self):
+        if not os.path.exists(self.filename):
+            return False
+        with open(self.filename, "rt") as file:
+            line = file.readline()
+        return line.strip() == magicline
+
+    def migrate_format1_to_format2(self):
+        if not self.is_format1():
+            return
+        already_done = False
+        try:
+            with closing(shelve.open(self.filename_2, 'r')):
+                # The file opens correctly: we are already in version 2
+                already_done = True
+        except:
+            None
+        if already_done:
+            raise StandardError, "LocalStatus: both format 1 and 2 exist"
+        # Need to migrate
+        self.savelock.acquire()
+        try:
+            with open(self.filename, "rt") as file:
+                line = file.readline().strip()
+                assert(line)
+                assert(line == magicline)
+                with closing(_MessageList(self.filename_2, 'n')) as db:
+                    for line in file:
+                        line = line.strip()
+                        uid, flags = line.split(':')
+                        uid = _MessageList._to_key(uid)
+                        flags = [x for x in flags]
+                        db[uid] = { 'uid': uid, 'flags': flags }
+            os.unlink(self.filename)
+        finally:
+            self.savelock.release()
 
     def getaccountname(self):
         return self.accountname
@@ -45,7 +124,12 @@ class LocalStatusFolder(BaseFolder):
         return 0
 
     def isnewfolder(self):
-        return not os.path.exists(self.filename)
+        try:
+            with closing(shelve.open(self.filename_2, 'r')):
+                return False
+        except anydbm.error:
+            return True
+        assert False
 
     def getname(self):
         return self.name
@@ -60,57 +144,28 @@ class LocalStatusFolder(BaseFolder):
         return self.filename
 
     def deletemessagelist(self):
-        if not self.isnewfolder():
-            os.unlink(self.filename)
-
-    def cachemessagelist(self):
-        if self.isnewfolder():
-            self.messagelist = {}
-            return
-        file = open(self.filename, "rt")
-        self.messagelist = {}
-        line = file.readline().strip()
-        if not line and not line.read():
-            # The status file is empty - should not have happened,
-            # but somehow did.
-            file.close()
-            return
-        assert(line == magicline)
-        for line in file.xreadlines():
-            line = line.strip()
-            uid, flags = line.split(':')
-            uid = long(uid)
-            flags = [x for x in flags]
-            self.messagelist[uid] = {'uid': uid, 'flags': flags}
-        file.close()
-
-    def autosave(self):
-        if self.doautosave:
-            self.save()
-
-    def save(self):
         self.savelock.acquire()
         try:
-            file = open(self.filename + ".tmp", "wt")
-            file.write(magicline + "\n")
-            for msg in self.messagelist.values():
-                flags = msg['flags']
-                flags.sort()
-                flags = ''.join(flags)
-                file.write("%s:%s\n" % (msg['uid'], flags))
-            file.flush()
-            if self.dofsync:
-                os.fsync(file.fileno())
-            file.close()
-            os.rename(self.filename + ".tmp", self.filename)
-
-            if self.dofsync:
-                fd = os.open(os.path.dirname(self.filename), os.O_RDONLY)
-                os.fsync(fd)
-                os.close(fd)
-
+            if not self.isnewfolder():
+                with closing(shelve.open(self.filename_2, 'n')) as db:
+                    None
         finally:
             self.savelock.release()
+
+    def cachemessagelist(self):
+        self.savelock.acquire()
+        try:
+            if self.messagelist == None:
+                if self.isnewfolder():
+                    self.messagelist = _MessageList(self.filename_2, 'n')
+                else:
+                    self.messagelist = _MessageList(self.filename_2, 'w')
+            return self.messagelist
+        finally:
+            self.savelock.release()
+
+    def save(self):
+         None
 
     def getmessagelist(self):
         return self.messagelist
@@ -125,7 +180,6 @@ class LocalStatusFolder(BaseFolder):
             return uid
 
         self.messagelist[uid] = {'uid': uid, 'flags': flags, 'time': rtime}
-        self.autosave()
         return uid
 
     def getmessageflags(self, uid):
@@ -135,8 +189,15 @@ class LocalStatusFolder(BaseFolder):
         return self.messagelist[uid]['time']
 
     def savemessageflags(self, uid, flags):
-        self.messagelist[uid]['flags'] = flags
-        self.autosave()
+        self.savelock.acquire()
+        try:
+            desc = self.messagelist[uid]
+            desc['flags'] = flags
+            # XXX assigning to messagelist is required to persist. See
+            # shelve.open
+            self.messagelist[uid] = desc
+        finally:
+            self.savelock.release()
 
     def deletemessage(self, uid):
         self.deletemessages([uid])
@@ -144,9 +205,5 @@ class LocalStatusFolder(BaseFolder):
     def deletemessages(self, uidlist):
         # Weed out ones not in self.messagelist
         uidlist = [uid for uid in uidlist if uid in self.messagelist]
-        if not len(uidlist):
-            return
-
         for uid in uidlist:
             del(self.messagelist[uid])
-        self.autosave()
